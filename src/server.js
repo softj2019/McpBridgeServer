@@ -15,12 +15,12 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
  * 설정 (환경변수 권장)
  * ========================= */
 const LOCAL_FILE_AGENT_BASE_URL =
-    process.env.LOCAL_FILE_AGENT_BASE_URL || "http://localhost:4312";
+    process.env.LOCAL_FILE_AGENT_BASE_URL || "http://58.121.142.180:4312";
 
 const PORT = Number(process.env.PORT || 8787);
 
 // Agent Builder에서 헤더 전달 안 될 때 fallback
-const DEFAULT_AGENT_TOKEN = process.env.DEFAULT_AGENT_TOKEN || "";
+const DEFAULT_AGENT_TOKEN = process.env.DEFAULT_AGENT_TOKEN || "73025532";
 
 const CORS_ALLOW_ORIGIN = "*";
 
