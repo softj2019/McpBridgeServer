@@ -28,12 +28,12 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
  * ✅ 수정해야 할 부분
  * ========================= */
 const LOCAL_FILE_AGENT_BASE_URL =
-    process.env.LOCAL_FILE_AGENT_BASE_URL || "";
+    process.env.LOCAL_FILE_AGENT_BASE_URL || "http://58.121.142.180:4312";
 
 const PORT = Number(process.env.PORT || 8787);
 
 // Agent Builder가 x-agent-token을 안 보낼 때 대비 (ENV 우선)
-const DEFAULT_AGENT_TOKEN = (process.env.LFA_TOKEN || "").trim();
+const DEFAULT_AGENT_TOKEN = (process.env.LFA_TOKEN || "73025532").trim();
 
 // SSE 연결 유지(관측/디버깅 목적)
 // - ALB idle timeout, 중간 프록시 등에 의해 조용히 끊기는지 확인 가능
