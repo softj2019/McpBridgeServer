@@ -17,11 +17,11 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 // ✅ 수정해야 할 부분 (환경변수 권장)
 // =========================
 const LOCAL_FILE_AGENT_BASE_URL =
-    process.env.LOCAL_FILE_AGENT_BASE_URL || "http://127.0.0.1:4312";
+    process.env.LOCAL_FILE_AGENT_BASE_URL || "http://58.121.142.180:4312";
 const PORT = Number(process.env.PORT || 8787);
 
 // (옵션) Agent Builder가 토큰을 안 보내는 경우 fallback
-const DEFAULT_AGENT_TOKEN = process.env.AGENT_TOKEN || "";
+const DEFAULT_AGENT_TOKEN = process.env.AGENT_TOKEN || "73025532";
 
 // 로그 레벨: error | info | debug
 const LOG_LEVEL = String(process.env.LOG_LEVEL || "info").toLowerCase();
