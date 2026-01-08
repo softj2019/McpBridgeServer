@@ -1,16 +1,19 @@
 /**
- * Local File Agent MCP Bridge (OpenAI MCP 호환: discovery 분리 / transport 전용화)
+ * Local File Agent MCP Bridge (OpenAI MCP Client 호환 최종본)
  *
  * ✅ 수정해야 할 부분
  * 1) LOCAL_FILE_AGENT_BASE_URL
  * 2) LFA_TOKEN(env) 또는 DEFAULT_AGENT_TOKEN
  * 3) PORT
  *
- * 설계:
- * - /mcp.json : Discovery(JSON) 전용 (연결 폼에 이 URL 입력)
- * - /mcp      : Transport 전용
- *    - GET  /mcp => SSE (text/event-stream)
- *    - POST /mcp => Streamable HTTP messages
+ * 핵심 라우팅 규칙(중요):
+ * - /mcp.json : Discovery(JSON) 전용
+ * - /mcp      : OpenAI가 실제로 호출하는 엔드포인트
+ *    - GET /mcp (Accept: text/event-stream) => Transport(SSE)
+ *    - GET /mcp (그 외)                    => Discovery(JSON)
+ *    - POST /mcp:
+ *        - 세션 식별자 없음 => Discovery(JSON)  (★ 현재 네 로그의 첫 POST 케이스 대응)
+ *        - 세션 식별자 있음 => Transport(Messages)
  */
 
 import http from "node:http";
@@ -39,7 +42,8 @@ const state = {
     lastAgentUa: "",
     counters: {
         total: 0,
-        discovery: { get: 0 },
+        health: 0,
+        discovery: { mcpjson: 0, mcpGet: 0, mcpPost: 0 },
         transport: { mcpGet: 0, mcpPost: 0 },
     },
 };
@@ -91,6 +95,42 @@ function writeJson(res, status, payload, extra = {}) {
     res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...extra });
     res.end(JSON.stringify(payload));
 }
+function wantsEventStream(req) {
+    return String(req.headers["accept"] || "").includes("text/event-stream");
+}
+
+/**
+ * ✅ 세션/연결 식별자 감지
+ * - OpenAI/프록시/SDK 버전에 따라 헤더명이 달라질 수 있어 후보를 넓게 잡음
+ * - "없으면" 초기 단계로 보고 discovery로 응답(POST /mcp에서도!)
+ */
+function getSessionId(req) {
+    const h = req.headers;
+
+    const candidates = [
+        "mcp-session-id",
+        "x-mcp-session-id",
+        "mcp-session",
+        "x-mcp-session",
+        "mcp-connection-id",
+        "x-mcp-connection-id",
+    ];
+
+    for (const k of candidates) {
+        const v = h[k];
+        const s = Array.isArray(v) ? v[0] : v;
+        if (s && String(s).trim()) return String(s).trim();
+    }
+
+    // 쿼리로 세션을 보내는 구현도 가끔 있어서 보조로 체크
+    try {
+        const u = new URL(req.url || "/", `http://${h.host || "localhost"}`);
+        const qs = u.searchParams.get("session") || u.searchParams.get("mcpSessionId") || "";
+        if (qs.trim()) return qs.trim();
+    } catch {}
+
+    return "";
+}
 
 /** =========================
  * local-file-agent fetch
@@ -131,7 +171,7 @@ async function lfaFetch(path, opts = {}) {
 /** =========================
  * MCP Tools
  * ========================= */
-const mcp = new McpServer({ name: "lfa-bridge", version: "2.2.0" });
+const mcp = new McpServer({ name: "lfa-bridge", version: "2.3.0" });
 
 mcp.tool("lfa_health", "Check local agent health", z.object({}), async (_args, ctx) => {
     const headers = (ctx?.requestContext?.headers || {});
@@ -176,7 +216,6 @@ function buildDiscovery(req) {
             sse: `${base}/mcp`,
             messages: `${base}/mcp`,
             health: `${base}/health`,
-            // (선택) OAuth 엔드포인트를 계속 노출하고 싶으면 여기 추가 가능
         },
     };
 }
@@ -187,7 +226,7 @@ function buildDiscovery(req) {
 async function handleTransport(req, res, { reqId, ip, pathname }) {
     state.lastSseAt = nowIso();
 
-    // ✅ GET은 반드시 event-stream
+    // GET은 event-stream 강제
     if ((req.method || "GET").toUpperCase() === "GET") {
         res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     }
@@ -198,8 +237,9 @@ async function handleTransport(req, res, { reqId, ip, pathname }) {
     const token = extractToken(req);
     log("INFO", reqId, "SSE_ENTER", { token: maskToken(token), path: pathname });
 
-    let counted = false;
     const startMs = Date.now();
+    let counted = false;
+
     const decActive = () => {
         if (!counted) return;
         counted = false;
@@ -276,6 +316,8 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    const sessionId = getSessionId(req);
+
     log("INFO", reqId, "REQ", {
         ip,
         method,
@@ -283,25 +325,21 @@ const server = http.createServer(async (req, res) => {
         pathname,
         proto: getProto(req),
         host: getHost(req),
-        headers: {
-            host: req.headers["host"] || "",
-            accept: req.headers["accept"] || "",
-            "content-type": req.headers["content-type"] || "",
-            "user-agent": req.headers["user-agent"] || "",
-        },
+        accept: req.headers["accept"] || "",
+        contentType: req.headers["content-type"] || "",
+        ua: req.headers["user-agent"] || "",
+        sessionId: sessionId ? `${sessionId.slice(0, 6)}...` : "",
     });
 
     // health
     if (pathname === "/health" && method === "GET") {
+        state.counters.health += 1;
         return writeJson(res, 200, { ok: true, time: nowIso(), state }, { "cache-control": "no-store" });
     }
 
-    /**
-     * ✅ Discovery 전용: /mcp.json
-     * - 연결 폼에는 반드시 https://mcp.cmstudio.app/mcp.json 을 입력
-     */
+    // discovery 전용
     if (pathname === "/mcp.json" && method === "GET") {
-        state.counters.discovery.get += 1;
+        state.counters.discovery.mcpjson += 1;
         state.lastDiscoveryAt = nowIso();
         state.lastAgentIp = ip;
         state.lastAgentUa = String(req.headers["user-agent"] || "");
@@ -309,21 +347,40 @@ const server = http.createServer(async (req, res) => {
     }
 
     /**
-     * ✅ Transport 전용: /mcp
-     * - GET  /mcp : SSE
-     * - POST /mcp : messages
+     * ✅ /mcp 처리
      */
-    if (pathname === "/mcp" && (method === "GET" || method === "POST")) {
-        if (method === "GET") state.counters.transport.mcpGet += 1;
-        else state.counters.transport.mcpPost += 1;
-        return handleTransport(req, res, { reqId, ip, pathname: "/mcp" });
+    if (pathname === "/mcp" && method === "GET") {
+        // GET은 Accept를 보고 분기
+        if (wantsEventStream(req)) {
+            state.counters.transport.mcpGet += 1;
+            return handleTransport(req, res, { reqId, ip, pathname: "/mcp" });
+        }
+
+        state.counters.discovery.mcpGet += 1;
+        state.lastDiscoveryAt = nowIso();
+        state.lastAgentIp = ip;
+        state.lastAgentUa = String(req.headers["user-agent"] || "");
+        return writeJson(res, 200, buildDiscovery(req), { "cache-control": "no-store" });
     }
 
-    // (선택) 실수로 /mcp.json 대신 /mcp를 discovery로 호출하는 걸 막기 위해 안내
-    if (pathname === "/mcp" && method === "GET") {
-        res.writeHead(307, { Location: "/mcp.json" });
-        res.end();
-        return;
+    if (pathname === "/mcp" && method === "POST") {
+        /**
+         * ★ 여기(가장 중요)
+         * - 지금 네 로그의 첫 요청은 POST /mcp 이고 세션이 없음
+         * - 이걸 transport로 처리하면 20초 후 aborted가 재현됨
+         * - 따라서 세션이 없으면 무조건 discovery JSON 반환
+         */
+        if (!sessionId) {
+            state.counters.discovery.mcpPost += 1;
+            state.lastDiscoveryAt = nowIso();
+            state.lastAgentIp = ip;
+            state.lastAgentUa = String(req.headers["user-agent"] || "");
+            return writeJson(res, 200, buildDiscovery(req), { "cache-control": "no-store" });
+        }
+
+        // 세션이 있으면 transport message로 처리
+        state.counters.transport.mcpPost += 1;
+        return handleTransport(req, res, { reqId, ip, pathname: "/mcp" });
     }
 
     res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
@@ -334,6 +391,6 @@ server.listen(PORT, "0.0.0.0", () => {
     console.log(`Bridge started :${PORT}`);
     console.log(`LFA base      : ${LOCAL_FILE_AGENT_BASE_URL}`);
     console.log(`Discovery     : http://localhost:${PORT}/mcp.json`);
-    console.log(`Transport     : http://localhost:${PORT}/mcp`);
+    console.log(`MCP endpoint  : http://localhost:${PORT}/mcp`);
     console.log(`Health        : http://localhost:${PORT}/health`);
 });
