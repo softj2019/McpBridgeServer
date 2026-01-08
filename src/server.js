@@ -1,5 +1,5 @@
 /**
- * Local File Agent MCP Bridge (ALB + Streamable HTTP + GPT Agent MCP Compatibility)
+ * Local File Agent MCP Bridge (ALB + Streamable HTTP + OpenAI MCP Client Compatible)
  *
  * ✅ 수정해야 할 부분
  * 1) LOCAL_FILE_AGENT_BASE_URL: local-file-agent 주소
@@ -47,17 +47,15 @@ const state = {
     lastAgentIp: "",
     lastAgentUa: "",
 
-    // ✅ OpenAI/GPT 에이전트 모드 디버깅용 카운터
     reqCounters: {
         total: 0,
-        mcp: { get: 0, post: 0 },
+        mcp: { get: 0, post: 0, getSse: 0, getJson: 0 },
         sse: { get: 0, post: 0 },
         wellKnown: { authServer: 0, protectedResource: 0 },
         oauthToken: { post: 0 },
         debug: { echo: 0, pingLfa: 0, state: 0, lastRpc: 0 },
     },
 
-    // ✅ 마지막으로 관측한 "MCP 메시지/RPC" 단서(실제로는 SDK 내부라 제한적)
     lastRpc: {
         at: "",
         ip: "",
@@ -65,8 +63,6 @@ const state = {
         method: "",
         path: "",
         headersHint: {},
-        bodyPreview: "",
-        bodyBytes: 0,
         note: "",
     },
 };
@@ -97,7 +93,6 @@ function getProto(req) {
 }
 
 function getHost(req) {
-    // ALB 환경에서 x-forwarded-host가 비는 경우도 있어 host fallback
     return (req.headers["x-forwarded-host"] || req.headers["host"] || "").toString();
 }
 
@@ -172,48 +167,9 @@ function log(level, reqId, msg, obj) {
     else console.log(`${line} ${safeJson(obj)}`);
 }
 
-/** =========================
- * ✅ 디버깅: "마지막 RPC/메시지" 스냅샷(최대 N bytes)
- * - StreamableHTTPServerTransport 내부 payload는 SDK가 처리하므로,
- *   여기서는 POST 요청이 들어왔는지, 대략 어떤 바디인지 정도만 기록한다.
- * ========================= */
-async function snapshotIncomingBodyIfAny(req, { pathname, ip }) {
-    // GET은 바디가 거의 없으니 스킵
-    const method = (req.method || "GET").toUpperCase();
-    if (method !== "POST" && method !== "PUT" && method !== "PATCH") return;
-
-    // content-type 힌트가 JSON-ish일 때만 캡처(보안/노이즈 줄이기)
-    const ct = String(req.headers["content-type"] || "");
-    const looksJson = ct.includes("application/json") || ct.includes("json") || ct.includes("text/plain");
-
-    if (!looksJson) return;
-
-    const bodyBuf = await readBody(req);
-    const max = 8192; // 8KB 프리뷰 제한
-    const previewBuf = bodyBuf.slice(0, max);
-    const preview = previewBuf.toString("utf-8");
-
-    // 민감정보 마스킹(아주 기본)
-    const masked = preview
-        .replace(/"authorization"\s*:\s*"[^"]*"/gi, `"authorization":"****"`)
-        .replace(/"access_token"\s*:\s*"[^"]*"/gi, `"access_token":"****"`)
-        .replace(/"x-agent-token"\s*:\s*"[^"]*"/gi, `"x-agent-token":"****"`)
-        .replace(/bearer\s+[a-z0-9\-\._~\+\/]+=*/gi, "bearer ****");
-
-    state.lastRpc = {
-        at: nowIso(),
-        ip,
-        ua: String(req.headers["user-agent"] || ""),
-        method,
-        path: pathname,
-        headersHint: pickHeaders(req.headers),
-        bodyPreview: masked,
-        bodyBytes: bodyBuf.length,
-        note:
-            bodyBuf.length > max
-                ? `bodyPreview truncated to ${max} bytes`
-                : "bodyPreview captured",
-    };
+function wantsEventStream(req) {
+    const a = String(req.headers["accept"] || "");
+    return a.includes("text/event-stream");
 }
 
 /** =========================
@@ -223,9 +179,7 @@ async function lfaFetch(path, opts = {}) {
     const { method = "GET", token = "", body } = opts;
     const url = `${LOCAL_FILE_AGENT_BASE_URL}${path}`;
 
-    const headers = {
-        "content-type": "application/json",
-    };
+    const headers = { "content-type": "application/json" };
     if (token) headers["x-agent-token"] = token;
 
     const started = Date.now();
@@ -259,12 +213,11 @@ async function lfaFetch(path, opts = {}) {
 /** =========================
  * MCP Tools
  * ========================= */
-const mcp = new McpServer({ name: "lfa-bridge", version: "1.4.0" });
+const mcp = new McpServer({ name: "lfa-bridge", version: "1.5.0" });
 
 mcp.tool("lfa_health", "Check local agent health", z.object({}), async (_args, ctx) => {
     const headers = (ctx?.requestContext?.headers || {});
     const token = (headers["x-agent-token"] || DEFAULT_AGENT_TOKEN).toString();
-
     const r = await lfaFetch("/health", { method: "GET", token });
     return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
 });
@@ -272,7 +225,6 @@ mcp.tool("lfa_health", "Check local agent health", z.object({}), async (_args, c
 mcp.tool("lfa_index_summary", "Get index summary", z.object({}), async (_args, ctx) => {
     const headers = (ctx?.requestContext?.headers || {});
     const token = (headers["x-agent-token"] || DEFAULT_AGENT_TOKEN).toString();
-
     const r = await lfaFetch("/index/summary", { method: "GET", token });
     return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
 });
@@ -280,24 +232,112 @@ mcp.tool("lfa_index_summary", "Get index summary", z.object({}), async (_args, c
 mcp.tool("lfa_index_build", "Build index", z.object({}), async (_args, ctx) => {
     const headers = (ctx?.requestContext?.headers || {});
     const token = (headers["x-agent-token"] || DEFAULT_AGENT_TOKEN).toString();
-
     const r = await lfaFetch("/index", { method: "POST", token, body: {} });
     return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
 });
 
-mcp.tool(
-    "lfa_file_read",
-    "Read file by path",
-    z.object({ path: z.string() }),
-    async (args, ctx) => {
-        const headers = (ctx?.requestContext?.headers || {});
-        const token = (headers["x-agent-token"] || DEFAULT_AGENT_TOKEN).toString();
+mcp.tool("lfa_file_read", "Read file by path", z.object({ path: z.string() }), async (args, ctx) => {
+    const headers = (ctx?.requestContext?.headers || {});
+    const token = (headers["x-agent-token"] || DEFAULT_AGENT_TOKEN).toString();
+    const qs = new URLSearchParams({ path: args.path });
+    const r = await lfaFetch(`/file?${qs.toString()}`, { method: "GET", token });
+    return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
+});
 
-        const qs = new URLSearchParams({ path: args.path });
-        const r = await lfaFetch(`/file?${qs.toString()}`, { method: "GET", token });
-        return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
+/** =========================
+ * Transport 연결 공통 처리
+ * - /mcp (Accept:text/event-stream 이거나 POST) /sse 모두 지원
+ * ========================= */
+async function handleTransport(req, res, { reqId, ip, pathname }) {
+    state.lastSseAt = nowIso();
+
+    if (pathname === "/sse") {
+        if (req.method === "GET") state.reqCounters.sse.get += 1;
+        else if (req.method === "POST") state.reqCounters.sse.post += 1;
+    } else if (pathname === "/mcp") {
+        if (req.method === "GET") state.reqCounters.mcp.getSse += 1;
+        else if (req.method === "POST") state.reqCounters.mcp.post += 1;
     }
-);
+
+    // 안전한 최소 관측 (바디는 읽지 않음: SDK와 충돌 방지)
+    state.lastRpc = {
+        at: nowIso(),
+        ip,
+        ua: String(req.headers["user-agent"] || ""),
+        method: String(req.method || "GET").toUpperCase(),
+        path: pathname,
+        headersHint: pickHeaders(req.headers),
+        note:
+            pathname === "/mcp"
+                ? "Transport on /mcp (OpenAI content-negotiation compatible)"
+                : "Transport on /sse",
+    };
+
+    const token = extractToken(req);
+    log("INFO", reqId, "SSE_ENTER", { token: maskToken(token) });
+
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+
+    let counted = false;
+    const startMs = Date.now();
+
+    const decActive = () => {
+        if (!counted) return;
+        counted = false;
+        state.activeSse = Math.max(0, state.activeSse - 1);
+    };
+
+    res.on("close", () => {
+        decActive();
+        log("INFO", reqId, "SSE_RES_CLOSE", {
+            activeSse: state.activeSse,
+            aliveMs: Date.now() - startMs,
+            path: pathname,
+        });
+    });
+
+    req.on("aborted", () => {
+        log("WARN", reqId, "SSE_REQ_ABORTED", { aliveMs: Date.now() - startMs, path: pathname });
+    });
+
+    try {
+        state.activeSse += 1;
+        counted = true;
+        log("INFO", reqId, "SSE_ACTIVE_INC", { activeSse: state.activeSse });
+
+        const transport = new StreamableHTTPServerTransport(req, res, {
+            requestContext: {
+                reqId,
+                ip,
+                headers: {
+                    ...Object.fromEntries(
+                        Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v[0] : (v ?? "")])
+                    ),
+                    "x-agent-token": token,
+                },
+            },
+        });
+
+        log("INFO", reqId, "SSE_TRANSPORT_CREATED");
+        await mcp.connect(transport);
+        log("INFO", reqId, "SSE_MCP_CONNECTED");
+        return;
+    } catch (e) {
+        decActive();
+        log("ERROR", reqId, "SSE_CONNECT_FAIL", { message: e?.message, stack: e?.stack });
+
+        try {
+            if (!res.headersSent) {
+                return writeJson(res, 500, { ok: false, message: e?.message, reqId }, { "cache-control": "no-store" });
+            }
+        } catch {}
+        try {
+            res.end();
+        } catch {}
+    }
+}
 
 /** =========================
  * HTTP Server
@@ -308,13 +348,12 @@ const server = http.createServer(async (req, res) => {
     const method = (req.method || "GET").toUpperCase();
     const rawUrl = req.url || "/";
 
-    // ✅ pathname 기반 라우팅(쿼리/프리픽스/startsWith 사고 방지)
     const parsed = new URL(rawUrl, `http://${req.headers.host || "localhost"}`);
     const pathname = parsed.pathname;
 
     state.reqCounters.total += 1;
 
-    // CORS (원격 디버깅/브라우저 확인용)
+    // CORS
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-agent-token");
@@ -326,7 +365,6 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // 공통 요청 로그
     log("INFO", reqId, "REQ", {
         ip,
         method,
@@ -337,15 +375,12 @@ const server = http.createServer(async (req, res) => {
         headers: pickHeaders(req.headers),
     });
 
-    // 연결/에러 이벤트(관측 강화)
     req.on("aborted", () => log("WARN", reqId, "REQ_ABORTED_BY_CLIENT"));
     req.on("error", (e) => log("ERROR", reqId, "REQ_STREAM_ERROR", { message: e?.message }));
     res.on("close", () => log("INFO", reqId, "RES_CLOSE"));
     res.on("finish", () => log("INFO", reqId, "RES_FINISH"));
 
-    /** =========================
-     * Basic Endpoints
-     * ========================= */
+    /** health/debug */
     if (pathname === "/health" && method === "GET") {
         return writeJson(
             res,
@@ -358,7 +393,7 @@ const server = http.createServer(async (req, res) => {
                 lfaBase: LOCAL_FILE_AGENT_BASE_URL,
                 tokenFallback: maskToken(DEFAULT_AGENT_TOKEN),
                 discovery: "/mcp",
-                transport: "/sse",
+                transport: ["/mcp (SSE via Accept)", "/sse (alt)"],
             },
             { "cache-control": "no-store" }
         );
@@ -380,14 +415,7 @@ const server = http.createServer(async (req, res) => {
         return writeJson(
             res,
             200,
-            {
-                ok: true,
-                method,
-                url: rawUrl,
-                pathname,
-                headers: pickHeaders(req.headers),
-                body: body.length ? body.toString("utf-8") : "",
-            },
+            { ok: true, method, url: rawUrl, pathname, headers: pickHeaders(req.headers), body: body.toString("utf-8") },
             { "cache-control": "no-store" }
         );
     }
@@ -397,50 +425,23 @@ const server = http.createServer(async (req, res) => {
         try {
             const token = extractToken(req);
             const r = await lfaFetch("/index/summary", { method: "GET", token });
-            return writeJson(
-                res,
-                200,
-                {
-                    ok: true,
-                    token: maskToken(token),
-                    lfa: r,
-                },
-                { "cache-control": "no-store" }
-            );
+            return writeJson(res, 200, { ok: true, token: maskToken(token), lfa: r }, { "cache-control": "no-store" });
         } catch (e) {
-            log("ERROR", reqId, "DEBUG_PING_LFA_FAIL", {
-                message: e?.message,
-                status: e?.status,
-                ms: e?.ms,
-                payload: e?.payload,
-            });
             return writeJson(
                 res,
                 500,
-                {
-                    ok: false,
-                    message: e?.message,
-                    status: e?.status,
-                    ms: e?.ms,
-                    payload: e?.payload,
-                },
+                { ok: false, message: e?.message, status: e?.status, payload: e?.payload },
                 { "cache-control": "no-store" }
             );
         }
     }
 
-    /** =========================
-     * ✅ OAuth / Well-known (JSON로 반드시 선처리)
-     * ========================= */
-    // 1) Authorization Server Metadata
+    /** OAuth well-known */
     if (pathname === "/mcp/.well-known/oauth-authorization-server" && method === "GET") {
         state.reqCounters.wellKnown.authServer += 1;
-
         const base = `${getProto(req)}://${getHost(req)}`;
         const issuer = `${base}/mcp`;
-
         state.lastDiscoveryAt = nowIso();
-
         return writeJson(
             res,
             200,
@@ -454,76 +455,69 @@ const server = http.createServer(async (req, res) => {
         );
     }
 
-    // 2) Protected Resource Metadata
     if (pathname === "/mcp/.well-known/oauth-protected-resource" && method === "GET") {
         state.reqCounters.wellKnown.protectedResource += 1;
-
         const base = `${getProto(req)}://${getHost(req)}`;
         const resource = `${base}/mcp`;
-
         state.lastDiscoveryAt = nowIso();
-
         return writeJson(
             res,
             200,
-            {
-                resource,
-                authorization_servers: [resource],
-            },
+            { resource, authorization_servers: [resource] },
             { "cache-control": "no-store" }
         );
     }
 
-    // 3) Token Endpoint (최소 구현: client_credentials)
     if (pathname === "/mcp/oauth/token" && method === "POST") {
         state.reqCounters.oauthToken.post += 1;
-
-        // body는 필요하면 읽어서 grant_type 검증도 가능하지만, 여기선 최소 구현
         const token = extractToken(req);
         state.lastTokenIssuedAt = nowIso();
-
         return writeJson(
             res,
             200,
-            {
-                access_token: token,
-                token_type: "Bearer",
-                expires_in: 3600,
-            },
+            { access_token: token, token_type: "Bearer", expires_in: 3600 },
             { "cache-control": "no-store" }
         );
     }
 
     /** =========================
-     * ✅ MCP Discovery Endpoint
-     * - GPT/에이전트 호환성을 위해 sseEndpoint(상대), endpoints.sse(절대),
-     *   sseUrl(절대 별칭), endpoints.messages(POST 대상 힌트) 모두 제공
+     * ✅ 핵심: /mcp 콘텐츠 네고시에이션
+     * - GET /mcp + Accept:text/event-stream  => Transport(SSE)
+     * - GET /mcp + 그 외                    => Discovery(JSON)
+     * - POST /mcp                           => Transport(메시지 전송)
      * ========================= */
+
     if (pathname === "/mcp" && method === "GET") {
-        if (method === "GET") state.reqCounters.mcp.get += 1;
-        else state.reqCounters.mcp.post += 1;
+        state.reqCounters.mcp.get += 1;
+
+        if (wantsEventStream(req)) {
+            // ✅ OpenAI가 여기로 SSE를 기대함
+            return handleTransport(req, res, { reqId, ip, pathname });
+        }
+
+        // ✅ Discovery(JSON)
+        state.reqCounters.mcp.getJson += 1;
 
         state.lastDiscoveryAt = nowIso();
         state.lastAgentIp = ip;
-        state.lastAgentUa = (req.headers["user-agent"] || "").toString();
+        state.lastAgentUa = String(req.headers["user-agent"] || "");
 
         const base = `${getProto(req)}://${getHost(req)}`;
         const payload = {
             protocol: "mcp",
             transport: "streamable-http",
 
-            // ✅ 상대 경로(일부 구현이 이 값을 사용)
-            sseEndpoint: "/sse",
-
-            // ✅ 절대 URL 별칭(일부 구현이 절대 URL을 선호/요구)
-            sseUrl: `${base}/sse`,
+            // 상대/절대 모두 제공
+            sseEndpoint: "/mcp", // ✅ OpenAI 스타일: 같은 엔드포인트에서 Accept로 SSE
+            sseUrl: `${base}/mcp`,
 
             endpoints: {
-                // ✅ SSE 채널
-                sse: `${base}/sse`,
+                // OpenAI는 /mcp 자체를 SSE로 씀
+                sse: `${base}/mcp`,
+                messages: `${base}/mcp`,
 
-                // ✅ 메시지 전송(POST) 대상 힌트: 같은 엔드포인트로 POST가 들어오도록 유도
-                messages: `${base}/sse`,
+                // 다른 클라이언트 호환용 대체 엔드포인트도 유지
+                altSse: `${base}/sse`,
 
                 health: `${base}/health`,
                 debugEcho: `${base}/debug/echo`,
@@ -531,7 +525,6 @@ const server = http.createServer(async (req, res) => {
                 debugState: `${base}/debug/state`,
                 debugLastRpc: `${base}/debug/last-rpc`,
 
-                // OAuth discovery (클라이언트가 필요시 조회)
                 oauthAuthorizationServer: `${base}/mcp/.well-known/oauth-authorization-server`,
                 oauthProtectedResource: `${base}/mcp/.well-known/oauth-protected-resource`,
                 oauthToken: `${base}/mcp/oauth/token`,
@@ -542,122 +535,17 @@ const server = http.createServer(async (req, res) => {
         return writeJson(res, 200, payload, { "cache-control": "no-store" });
     }
 
-    /** =========================
-     * ✅ Transport Endpoint (/sse)
-     * - /mcp/.well-known/* 를 절대 잡아먹지 않게 경로를 완전히 분리
-     * - GET: SSE 채널
-     * - POST: (일부 구현에서) 메시지 전송에 사용될 수 있음 → 관측 위해 바디 스냅샷 기록
-     * ========================= */
-    if (pathname === "/sse" || pathname === "/mcp") {
-        // ✅ GPT 클라이언트가 POST로 메시지를 보낼 수 있어, 바디를 먼저 스냅샷(필요한 경우)
-        //    단, 이 readBody는 스트림을 소비하므로 "항상" 하면 SDK와 충돌할 수 있다.
-        //    따라서 "관측 목적"으로만 제한적으로 수행한다:
-        //    - content-type이 JSON-ish이고
-        //    - method가 POST일 때만
-        //
-        // ⚠️ 중요: POST 바디를 여기서 읽어버리면 SDK가 바디를 못 읽을 수 있다.
-        //         그래서 POST일 때는 "스냅샷"을 포기하고, 대신 헤더/메서드만 기록하는 모드로 변경.
-        //
-        // 결론: 안전 최우선으로 POST 바디는 읽지 않고, 힌트만 기록한다.
-        state.lastSseAt = nowIso();
-
-        if (method === "GET") state.reqCounters.sse.get += 1;
-        else if (method === "POST") state.reqCounters.sse.post += 1;
-
-        // ✅ 최소 관측(바디는 읽지 않음: SDK와 충돌 방지)
-        state.lastRpc = {
-            at: nowIso(),
-            ip,
-            ua: String(req.headers["user-agent"] || ""),
-            method,
-            path: pathname,
-            headersHint: pickHeaders(req.headers),
-            bodyPreview: "",
-            bodyBytes: 0,
-            note:
-                method === "POST"
-                    ? "POST received on /sse (body not captured to avoid consuming stream before SDK)"
-                    : "SSE channel connected (GET)",
-        };
-
-        const token = extractToken(req);
-        log("INFO", reqId, "SSE_ENTER", { token: maskToken(token) });
-
-        // ✅ 프록시 버퍼링 힌트 (바디는 SDK가 관리)
-        res.setHeader("Cache-Control", "no-cache, no-transform");
-        res.setHeader("Connection", "keep-alive");
-        res.setHeader("X-Accel-Buffering", "no");
-
-        // activeSse 카운팅 안정화
-        let counted = false;
-        const startMs = Date.now();
-
-        const decActive = () => {
-            if (!counted) return;
-            counted = false;
-            state.activeSse = Math.max(0, state.activeSse - 1);
-        };
-
-        res.on("close", () => {
-            decActive();
-            log("INFO", reqId, "SSE_RES_CLOSE", {
-                activeSse: state.activeSse,
-                aliveMs: Date.now() - startMs,
-            });
-        });
-
-        req.on("aborted", () => {
-            log("WARN", reqId, "SSE_REQ_ABORTED", { aliveMs: Date.now() - startMs });
-        });
-
-        try {
-            state.activeSse += 1;
-            counted = true;
-            log("INFO", reqId, "SSE_ACTIVE_INC", { activeSse: state.activeSse });
-
-            const transport = new StreamableHTTPServerTransport(req, res, {
-                requestContext: {
-                    reqId,
-                    ip,
-                    headers: {
-                        ...Object.fromEntries(
-                            Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v[0] : (v ?? "")])
-                        ),
-                        // tool ctx에서 토큰 바로 쓰기 좋게 정규화
-                        "x-agent-token": token,
-                    },
-                },
-            });
-
-            log("INFO", reqId, "SSE_TRANSPORT_CREATED");
-
-            await mcp.connect(transport);
-
-            log("INFO", reqId, "SSE_MCP_CONNECTED");
-            return;
-        } catch (e) {
-            decActive();
-            log("ERROR", reqId, "SSE_CONNECT_FAIL", {
-                message: e?.message,
-                stack: e?.stack,
-            });
-
-            // transport가 이미 response를 잡고 있을 수 있으니 안전 종료
-            try {
-                if (!res.headersSent) {
-                    return writeJson(res, 500, { ok: false, message: e?.message, reqId }, { "cache-control": "no-store" });
-                }
-            } catch {}
-            try {
-                res.end();
-            } catch {}
-            return;
-        }
+    if (pathname === "/mcp" && method === "POST") {
+        // ✅ OpenAI가 여기로도 POST를 보낼 수 있음(메시지 전송)
+        return handleTransport(req, res, { reqId, ip, pathname });
     }
 
-    /** =========================
-     * 404
-     * ========================= */
+    /** 대체 /sse 엔드포인트도 지원 */
+    if (pathname === "/sse" && (method === "GET" || method === "POST")) {
+        return handleTransport(req, res, { reqId, ip, pathname: "/sse" });
+    }
+
+    /** 404 */
     res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
     res.end("Not Found");
 });
@@ -665,8 +553,8 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, "0.0.0.0", () => {
     console.log(`Bridge started :${PORT}`);
     console.log(`LFA base      : ${LOCAL_FILE_AGENT_BASE_URL}`);
-    console.log(`Discovery     : http://localhost:${PORT}/mcp`);
-    console.log(`Transport     : http://localhost:${PORT}/sse`);
+    console.log(`MCP endpoint  : http://localhost:${PORT}/mcp (GET: discovery or SSE via Accept, POST: messages)`);
+    console.log(`Alt transport : http://localhost:${PORT}/sse`);
     console.log(`Health        : http://localhost:${PORT}/health`);
     console.log(`Debug state   : http://localhost:${PORT}/debug/state`);
     console.log(`Debug lastRpc : http://localhost:${PORT}/debug/last-rpc`);
