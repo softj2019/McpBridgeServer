@@ -1,22 +1,17 @@
 /**
- * Local File Agent MCP Bridge (OpenAI MCP 호환: discovery 분리 / transport 전용화)
+ * Local File Agent MCP Bridge (OpenAI MCP 호환 + OAuth well-known + token endpoint 복구)
  *
  * ✅ 수정해야 할 부분
- * 1) LOCAL_FILE_AGENT_BASE_URL
- * 2) LFA_TOKEN(env) 또는 DEFAULT_AGENT_TOKEN
+ * 1) LOCAL_FILE_AGENT_BASE_URL: local-file-agent 주소
+ * 2) DEFAULT_AGENT_TOKEN 또는 LFA_TOKEN(env)
  * 3) PORT
  *
- * ✅ 개선 사항(이번 수정에 포함)
- * - SSE keep-alive ping 추가(기본 15초): OpenAI MCP 클라이언트 idle 종료/재연결 로그(WARN) 감소
- * - /mcp GET 요청 중 "discovery 실수 호출" 방지: Accept 헤더가 event-stream 아니면 /mcp.json 으로 307 리다이렉트
- * - activeSse 카운트/정리 보강: close/aborted 시점 중복/예외에서도 정확히 decrement
- * - SSE_REQ_ABORTED 로그 레벨을 INFO로 완화(클라이언트 주도 종료가 일반적)
- *
- * 설계:
- * - /mcp.json : Discovery(JSON) 전용 (연결 폼에 이 URL 입력)
- * - /mcp      : Transport 전용
- *    - GET  /mcp => SSE (text/event-stream)
- *    - POST /mcp => Streamable HTTP messages
+ * 핵심:
+ * - OpenAI MCP 클라이언트는 /mcp 로 POST discovery를 먼저 때릴 수 있음
+ * - 그리고 /mcp/.well-known/oauth-authorization-server, /mcp/.well-known/oauth-protected-resource,
+ *   /mcp/oauth/token 을 확인할 수 있음(없으면 진행 중단하는 케이스 존재)
+ * - 따라서 discovery JSON에 OAuth 엔드포인트를 포함하고, 실제 엔드포인트도 200으로 응답
+ * - Transport(SSE)는 GET /mcp (Accept: text/event-stream)에서 처리
  */
 
 import http from "node:http";
@@ -34,11 +29,6 @@ const PORT = Number(process.env.PORT || 8787);
 const DEFAULT_AGENT_TOKEN = (process.env.LFA_TOKEN || "73025532").trim();
 
 /** =========================
- * (선택) 튜닝 파라미터
- * ========================= */
-const SSE_PING_INTERVAL_MS = Number(process.env.SSE_PING_INTERVAL_MS || 15000);
-
-/** =========================
  * 상태(관측)
  * ========================= */
 const state = {
@@ -50,8 +40,10 @@ const state = {
     lastAgentUa: "",
     counters: {
         total: 0,
-        discovery: { get: 0 },
-        transport: { mcpGet: 0, mcpPost: 0, mcpGetRedirectToDiscovery: 0 },
+        health: 0,
+        discovery: { mcpGet: 0, mcpPost: 0, mcpJson: 0 },
+        oauth: { authServer: 0, protectedResource: 0, token: 0 },
+        transport: { mcpGet: 0, mcpPost: 0 },
     },
 };
 
@@ -69,6 +61,7 @@ function log(level, reqId, msg, obj) {
     const line = `[${nowIso()}] [${level}] [${reqId}] ${msg}`;
     console.log(obj === undefined ? line : `${line} ${safeJson(obj)}`);
 }
+
 function getProto(req) {
     return (req.headers["x-forwarded-proto"] || "http").toString();
 }
@@ -98,14 +91,44 @@ function extractToken(req) {
     }
     return DEFAULT_AGENT_TOKEN;
 }
+function wantsEventStream(req) {
+    return String(req.headers["accept"] || "").includes("text/event-stream");
+}
 function writeJson(res, status, payload, extra = {}) {
-    res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...extra });
+    res.writeHead(status, {
+        "content-type": "application/json; charset=utf-8",
+        ...extra,
+    });
     res.end(JSON.stringify(payload));
 }
-function acceptIncludes(req, needle) {
-    const a = req.headers["accept"];
-    const accept = (Array.isArray(a) ? a.join(",") : a || "").toString().toLowerCase();
-    return accept.includes(String(needle).toLowerCase());
+
+/**
+ * 세션 식별자 감지
+ * - OpenAI/SDK 버전에 따라 없을 수도 있음
+ * - (중요) "없으면" 초기 POST를 discovery로 보고 JSON 응답
+ */
+function getSessionId(req) {
+    const h = req.headers;
+    const candidates = [
+        "mcp-session-id",
+        "x-mcp-session-id",
+        "mcp-session",
+        "x-mcp-session",
+        "mcp-connection-id",
+        "x-mcp-connection-id",
+    ];
+    for (const k of candidates) {
+        const v = h[k];
+        const s = Array.isArray(v) ? v[0] : v;
+        if (s && String(s).trim()) return String(s).trim();
+    }
+    // query fallback
+    try {
+        const u = new URL(req.url || "/", `http://${h.host || "localhost"}`);
+        const qs = u.searchParams.get("session") || u.searchParams.get("mcpSessionId") || "";
+        if (qs.trim()) return qs.trim();
+    } catch {}
+    return "";
 }
 
 /** =========================
@@ -147,31 +170,31 @@ async function lfaFetch(path, opts = {}) {
 /** =========================
  * MCP Tools
  * ========================= */
-const mcp = new McpServer({ name: "lfa-bridge", version: "2.3.0" });
+const mcp = new McpServer({ name: "lfa-bridge", version: "2.4.0" });
 
 mcp.tool("lfa_health", "Check local agent health", z.object({}), async (_args, ctx) => {
-    const headers = ctx?.requestContext?.headers || {};
+    const headers = (ctx?.requestContext?.headers || {});
     const token = (headers["x-agent-token"] || DEFAULT_AGENT_TOKEN).toString();
     const r = await lfaFetch("/health", { method: "GET", token });
     return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
 });
 
 mcp.tool("lfa_index_summary", "Get index summary", z.object({}), async (_args, ctx) => {
-    const headers = ctx?.requestContext?.headers || {};
+    const headers = (ctx?.requestContext?.headers || {});
     const token = (headers["x-agent-token"] || DEFAULT_AGENT_TOKEN).toString();
     const r = await lfaFetch("/index/summary", { method: "GET", token });
     return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
 });
 
 mcp.tool("lfa_index_build", "Build index", z.object({}), async (_args, ctx) => {
-    const headers = ctx?.requestContext?.headers || {};
+    const headers = (ctx?.requestContext?.headers || {});
     const token = (headers["x-agent-token"] || DEFAULT_AGENT_TOKEN).toString();
     const r = await lfaFetch("/index", { method: "POST", token, body: {} });
     return { content: [{ type: "text", text: JSON.stringify(r, null, 2) }] };
 });
 
 mcp.tool("lfa_file_read", "Read file by path", z.object({ path: z.string() }), async (args, ctx) => {
-    const headers = ctx?.requestContext?.headers || {};
+    const headers = (ctx?.requestContext?.headers || {});
     const token = (headers["x-agent-token"] || DEFAULT_AGENT_TOKEN).toString();
     const qs = new URLSearchParams({ path: args.path });
     const r = await lfaFetch(`/file?${qs.toString()}`, { method: "GET", token });
@@ -179,10 +202,14 @@ mcp.tool("lfa_file_read", "Read file by path", z.object({ path: z.string() }), a
 });
 
 /** =========================
- * Discovery payload
+ * Discovery & OAuth payload
  * ========================= */
+function buildBase(req) {
+    return `${getProto(req)}://${getHost(req)}`;
+}
+
 function buildDiscovery(req) {
-    const base = `${getProto(req)}://${getHost(req)}`;
+    const base = buildBase(req);
     return {
         protocol: "mcp",
         transport: "streamable-http",
@@ -192,8 +219,31 @@ function buildDiscovery(req) {
             sse: `${base}/mcp`,
             messages: `${base}/mcp`,
             health: `${base}/health`,
-            // (선택) OAuth 엔드포인트를 계속 노출하고 싶으면 여기 추가 가능
+
+            // ✅ OpenAI MCP가 확인할 수 있는 OAuth 관련 엔드포인트를 discovery에 포함
+            oauthAuthorizationServer: `${base}/mcp/.well-known/oauth-authorization-server`,
+            oauthProtectedResource: `${base}/mcp/.well-known/oauth-protected-resource`,
+            oauthToken: `${base}/mcp/oauth/token`,
         },
+    };
+}
+
+function buildOAuthAuthorizationServer(req) {
+    const base = buildBase(req);
+    // 너가 curl로 확인한 형태와 동일하게 유지
+    return {
+        issuer: `${base}/mcp`,
+        token_endpoint: `${base}/mcp/oauth/token`,
+        token_endpoint_auth_methods_supported: ["none"],
+        grant_types_supported: ["client_credentials"],
+    };
+}
+
+function buildOAuthProtectedResource(req) {
+    const base = buildBase(req);
+    return {
+        resource: `${base}/mcp`,
+        authorization_servers: [`${base}/mcp`],
     };
 }
 
@@ -203,10 +253,8 @@ function buildDiscovery(req) {
 async function handleTransport(req, res, { reqId, ip, pathname }) {
     state.lastSseAt = nowIso();
 
-    const method = (req.method || "GET").toUpperCase();
-
-    // ✅ GET(SSE)은 반드시 event-stream
-    if (method === "GET") {
+    // ✅ GET SSE는 반드시 event-stream
+    if ((req.method || "GET").toUpperCase() === "GET") {
         res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     }
     res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -218,7 +266,6 @@ async function handleTransport(req, res, { reqId, ip, pathname }) {
 
     const startMs = Date.now();
     let counted = false;
-    let pingTimer = null;
 
     const decActive = () => {
         if (!counted) return;
@@ -226,15 +273,7 @@ async function handleTransport(req, res, { reqId, ip, pathname }) {
         state.activeSse = Math.max(0, state.activeSse - 1);
     };
 
-    const stopPing = () => {
-        if (pingTimer) {
-            clearInterval(pingTimer);
-            pingTimer = null;
-        }
-    };
-
     res.on("close", () => {
-        stopPing();
         decActive();
         log("INFO", reqId, "SSE_RES_CLOSE", {
             activeSse: state.activeSse,
@@ -242,27 +281,13 @@ async function handleTransport(req, res, { reqId, ip, pathname }) {
             path: pathname,
         });
     });
-
     req.on("aborted", () => {
-        // 클라이언트가 의도적으로 끊는 경우가 흔해서 INFO로 둠
-        log("INFO", reqId, "SSE_REQ_ABORTED", { aliveMs: Date.now() - startMs, path: pathname });
+        log("WARN", reqId, "SSE_REQ_ABORTED", { aliveMs: Date.now() - startMs, path: pathname });
     });
 
     try {
         state.activeSse += 1;
         counted = true;
-
-        // ✅ SSE keep-alive ping (GET일 때만)
-        if (method === "GET") {
-            pingTimer = setInterval(() => {
-                try {
-                    // SSE 표준 형식: event/data + 빈 줄
-                    res.write(`event: ping\ndata: {}\n\n`);
-                } catch {
-                    // write 실패는 close 이벤트로 이어짐
-                }
-            }, SSE_PING_INTERVAL_MS);
-        }
 
         const transport = new StreamableHTTPServerTransport(req, res, {
             requestContext: {
@@ -270,7 +295,7 @@ async function handleTransport(req, res, { reqId, ip, pathname }) {
                 ip,
                 headers: {
                     ...Object.fromEntries(
-                        Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v[0] : v ?? ""])
+                        Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v[0] : (v ?? "")])
                     ),
                     "x-agent-token": token,
                 },
@@ -281,7 +306,6 @@ async function handleTransport(req, res, { reqId, ip, pathname }) {
         await mcp.connect(transport);
         log("INFO", reqId, "SSE_MCP_CONNECTED");
     } catch (e) {
-        stopPing();
         decActive();
         log("ERROR", reqId, "SSE_CONNECT_FAIL", { message: e?.message, stack: e?.stack });
         try {
@@ -307,6 +331,10 @@ const server = http.createServer(async (req, res) => {
 
     state.counters.total += 1;
 
+    // 공통 응답 이벤트 로그(이거 없으면 “응답이 나갔는지” 감이 안 잡힘)
+    res.on("finish", () => log("INFO", reqId, "RES_FINISH"));
+    res.on("close", () => log("INFO", reqId, "RES_CLOSE"));
+
     // CORS
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -319,6 +347,8 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    const sessionId = getSessionId(req);
+
     log("INFO", reqId, "REQ", {
         ip,
         method,
@@ -326,25 +356,51 @@ const server = http.createServer(async (req, res) => {
         pathname,
         proto: getProto(req),
         host: getHost(req),
-        headers: {
-            host: req.headers["host"] || "",
-            accept: req.headers["accept"] || "",
-            "content-type": req.headers["content-type"] || "",
-            "user-agent": req.headers["user-agent"] || "",
-        },
+        accept: req.headers["accept"] || "",
+        contentType: req.headers["content-type"] || "",
+        ua: req.headers["user-agent"] || "",
+        sessionId: sessionId ? `${sessionId.slice(0, 6)}...` : "",
     });
 
     // health
     if (pathname === "/health" && method === "GET") {
+        state.counters.health += 1;
         return writeJson(res, 200, { ok: true, time: nowIso(), state }, { "cache-control": "no-store" });
     }
 
-    /**
-     * ✅ Discovery 전용: /mcp.json
-     * - 연결 폼에는 반드시 https://<host>/mcp.json 을 입력
-     */
+    // ✅ OAuth well-known
+    if (pathname === "/mcp/.well-known/oauth-authorization-server" && method === "GET") {
+        state.counters.oauth.authServer += 1;
+        return writeJson(res, 200, buildOAuthAuthorizationServer(req), { "cache-control": "no-store" });
+    }
+
+    if (pathname === "/mcp/.well-known/oauth-protected-resource" && method === "GET") {
+        state.counters.oauth.protectedResource += 1;
+        return writeJson(res, 200, buildOAuthProtectedResource(req), { "cache-control": "no-store" });
+    }
+
+    // ✅ OAuth token endpoint (client_credentials, auth none)
+    if (pathname === "/mcp/oauth/token" && method === "POST") {
+        state.counters.oauth.token += 1;
+
+        // 실제로 검증할 필요가 없으면 “형태만 맞춰서” 토큰을 발급해도 됨
+        // (OpenAI가 token endpoint 존재 여부/형식만 체크하는 케이스 대응)
+        const token = `mcp_${randomUUID().replaceAll("-", "")}`;
+        return writeJson(
+            res,
+            200,
+            {
+                access_token: token,
+                token_type: "Bearer",
+                expires_in: 3600,
+            },
+            { "cache-control": "no-store" }
+        );
+    }
+
+    // discovery 전용도 제공(폼에서 쓰기 좋게)
     if (pathname === "/mcp.json" && method === "GET") {
-        state.counters.discovery.get += 1;
+        state.counters.discovery.mcpJson += 1;
         state.lastDiscoveryAt = nowIso();
         state.lastAgentIp = ip;
         state.lastAgentUa = String(req.headers["user-agent"] || "");
@@ -352,28 +408,54 @@ const server = http.createServer(async (req, res) => {
     }
 
     /**
-     * ✅ Transport 전용: /mcp
-     * - GET  /mcp : SSE
-     * - POST /mcp : messages
-     *
-     * ✅ 개선: 사람이 브라우저로 /mcp 를 열거나 discovery를 /mcp로 잘못 때리는 경우
-     * - Accept에 text/event-stream이 없으면 /mcp.json 으로 리다이렉트
+     * ✅ /mcp : discovery + transport 겸용(현실적으로 OpenAI가 여길 먼저 때림)
      */
-    if (pathname === "/mcp" && (method === "GET" || method === "POST")) {
-        if (method === "GET") {
-            const wantsSse = acceptIncludes(req, "text/event-stream");
-            if (!wantsSse) {
-                state.counters.transport.mcpGetRedirectToDiscovery += 1;
-                res.writeHead(307, { Location: "/mcp.json" });
-                res.end();
-                return;
-            }
+    if (pathname === "/mcp" && method === "GET") {
+        // GET은 Accept 기반 분기
+        if (wantsEventStream(req)) {
             state.counters.transport.mcpGet += 1;
-        } else {
-            state.counters.transport.mcpPost += 1;
+            return handleTransport(req, res, { reqId, ip, pathname: "/mcp" });
         }
 
+        // discovery
+        state.counters.discovery.mcpGet += 1;
+        state.lastDiscoveryAt = nowIso();
+        state.lastAgentIp = ip;
+        state.lastAgentUa = String(req.headers["user-agent"] || "");
+        log("INFO", reqId, "DISCOVERY_RETURNED", { via: "GET /mcp" });
+        return writeJson(res, 200, buildDiscovery(req), { "cache-control": "no-store" });
+    }
+
+    if (pathname === "/mcp" && method === "POST") {
+        /**
+         * ★ 여기(가장 중요)
+         * - 현재 네 로그: POST /mcp 가 sessionId 없이 먼저 옴
+         * - 이걸 transport로 처리하면 “20초 후 aborted”가 계속 재현됨
+         * - 따라서 sessionId 없으면 discovery JSON을 즉시 반환
+         *
+         * - sessionId가 생긴 뒤의 POST는 transport(messages)로 처리
+         */
+        if (!sessionId) {
+            state.counters.discovery.mcpPost += 1;
+            state.lastDiscoveryAt = nowIso();
+            state.lastAgentIp = ip;
+            state.lastAgentUa = String(req.headers["user-agent"] || "");
+            log("INFO", reqId, "DISCOVERY_RETURNED", { via: "POST /mcp", note: "no sessionId" });
+            return writeJson(res, 200, buildDiscovery(req), { "cache-control": "no-store" });
+        }
+
+        state.counters.transport.mcpPost += 1;
         return handleTransport(req, res, { reqId, ip, pathname: "/mcp" });
+    }
+
+    // 루트는 200으로 간단 응답(스캐너/헬스체크 대비)
+    if (pathname === "/" && method === "GET") {
+        return writeJson(
+            res,
+            200,
+            { ok: true, name: "lfa-bridge", time: nowIso(), discovery: "/mcp.json", mcp: "/mcp" },
+            { "cache-control": "no-store" }
+        );
     }
 
     res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
@@ -384,7 +466,9 @@ server.listen(PORT, "0.0.0.0", () => {
     console.log(`Bridge started :${PORT}`);
     console.log(`LFA base      : ${LOCAL_FILE_AGENT_BASE_URL}`);
     console.log(`Discovery     : http://localhost:${PORT}/mcp.json`);
-    console.log(`Transport     : http://localhost:${PORT}/mcp`);
+    console.log(`MCP endpoint  : http://localhost:${PORT}/mcp`);
+    console.log(`OAuth authsrv : http://localhost:${PORT}/mcp/.well-known/oauth-authorization-server`);
+    console.log(`OAuth protect : http://localhost:${PORT}/mcp/.well-known/oauth-protected-resource`);
+    console.log(`OAuth token   : http://localhost:${PORT}/mcp/oauth/token`);
     console.log(`Health        : http://localhost:${PORT}/health`);
-    console.log(`SSE ping(ms)  : ${SSE_PING_INTERVAL_MS}`);
 });
