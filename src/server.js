@@ -499,7 +499,7 @@ const server = http.createServer(async (req, res) => {
      * - GPT/에이전트 호환성을 위해 sseEndpoint(상대), endpoints.sse(절대),
      *   sseUrl(절대 별칭), endpoints.messages(POST 대상 힌트) 모두 제공
      * ========================= */
-    if (pathname === "/mcp" && (method === "GET" || method === "POST")) {
+    if (pathname === "/mcp" && method === "GET") {
         if (method === "GET") state.reqCounters.mcp.get += 1;
         else state.reqCounters.mcp.post += 1;
 
@@ -548,7 +548,7 @@ const server = http.createServer(async (req, res) => {
      * - GET: SSE 채널
      * - POST: (일부 구현에서) 메시지 전송에 사용될 수 있음 → 관측 위해 바디 스냅샷 기록
      * ========================= */
-    if (pathname === "/sse") {
+    if (pathname === "/sse" || pathname === "/mcp") {
         // ✅ GPT 클라이언트가 POST로 메시지를 보낼 수 있어, 바디를 먼저 스냅샷(필요한 경우)
         //    단, 이 readBody는 스트림을 소비하므로 "항상" 하면 SDK와 충돌할 수 있다.
         //    따라서 "관측 목적"으로만 제한적으로 수행한다:
